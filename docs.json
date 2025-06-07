@@ -1,0 +1,195 @@
+{
+  "auth": {
+    "register": {
+      "url": "/api/auth/register",
+      "method": "POST",
+      "payload": {
+        "email": "Test2@test.com",
+        "password": "Abeasd1234!",
+        "name": "test 123"
+      },
+      "response": {
+        "success": true,
+        "message": "Registration successful",
+        "data": {
+          "userId": "string",
+          "email": "string",
+          "name": "string"
+        }
+      },
+      "description": "Mendaftarkan pengguna baru dengan email, password, dan nama"
+    },
+    "login": {
+      "url": "/api/auth/login",
+      "method": "POST",
+      "payload": {
+        "email": "string, required",
+        "password": "string, required"
+      },
+      "response": {
+        "success": true,
+        "message": "Login successful",
+        "data": {
+          "token": "JWT token",
+          "user": {
+            "userId": "string",
+            "email": "string",
+            "name": "string",
+            "balance": "number (in IDR)",
+            "role": "user or admin"
+          }
+        }
+      },
+      "description": "Autentikasi pengguna dan memberikan token JWT"
+    },
+    "googleAuth": {
+      "url": "/api/auth/google",
+      "method": "GET",
+      "response": "Redirects to Google OAuth",
+      "description": "Memulai proses autentikasi Google OAuth2"
+    },
+    "googleCallback": {
+      "url": "/api/auth/google/callback",
+      "method": "GET",
+      "response": "Redirects with JWT token",
+      "description": "Callback endpoint untuk Google OAuth2"
+    },
+    "refreshToken": {
+      "url": "/api/auth/refresh",
+      "method": "POST",
+      "payload": {
+        "refreshToken": "string, required"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "token": "string (new JWT)",
+          "refreshToken": "string (new refresh token)"
+        }
+      },
+      "description": "Memperbaharui token JWT yang sudah kadaluarsa"
+    },
+    "verifyToken": {
+      "url": "/api/auth/verify",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "userId": "string",
+          "email": "string",
+          "name": "string",
+          "role": "user or admin"
+        }
+      },
+      "description": "Memverifikasi token JWT dan mengembalikan info pengguna"
+    }
+  },
+  "user": {
+    "getProfile": {
+      "url": "/api/user/profile",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "userId": "string",
+          "email": "string",
+          "name": "string",
+          "balance": "number (in IDR)",
+          "createdAt": "date",
+          "updatedAt": "date"
+        }
+      },
+      "description": "Mendapatkan profil pengguna yang sedang login"
+    },
+    "updateProfile": {
+      "url": "/api/user/profile",
+      "method": "PUT",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "name": "string, optional",
+        "password": "string, optional"
+      },
+      "response": {
+        "success": true,
+        "message": "Profile updated successfully",
+        "data": {
+          "userId": "string",
+          "email": "string",
+          "name": "string",
+          "updatedAt": "date"
+        }
+      },
+      "description": "Memperbarui profil pengguna (nama dan password)"
+    },
+    "getTopupHistory": {
+      "url": "/api/user/topup/history",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "query": {
+        "page": "number, optional, default: 1",
+        "limit": "number, optional, default: 10"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "topups": [{
+            "topupId": "string",
+            "amount": "number (in IDR)",
+            "status": "string (pending/success/failed)",
+            "paymentMethod": "string",
+            "createdAt": "date"
+          }],
+          "pagination": {
+            "total": "number",
+            "page": "number",
+            "limit": "number",
+            "pages": "number"
+          }
+        }
+      },
+      "description": "Mendapatkan riwayat topup saldo pengguna"
+    },
+    "getChatHistory": {
+      "url": "/api/user/chat/history",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "query": {
+        "page": "number, optional, default: 1",
+        "limit": "number, optional, default: 10"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "chats": [{
+            "chatId": "string",
+            "model": "string",
+            "promptTokens": "number",
+            "completionTokens": "number",
+            "totalTokens": "number",
+            "cost": "number (in IDR)",
+            "createdAt": "date"
+          }],
+          "pagination": {
+            "total": "number",
+            "page": "number",
+            "limit": "number",
+            "pages": "number"
+          }
+        }
+      },
+      "description": "Mendapatkan riwayat penggunaan LLM oleh pengguna"
+    }
+  }
+}

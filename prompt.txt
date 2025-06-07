@@ -1,0 +1,22 @@
+saya ingin mengubah backend llm saya dengan struktur database sebagai berikut, jika ada kolom yang perlu untuk ditambahkan silahkan saja
+
+conversation: {userId, title, conversationCreateAt, lastMessageAt}
+chat: {conversationId, userId, model, promptTokens, completionTokens, totalTokens, costUSD, costIDR, content: {prompt, response} filesUrl}
+
+adapun fitur yang akan saya ubah juga
+
+fitur conversation:
+1. get history conversation per userId: mendapatkan judul saja untuk navbar history chat
+2. delete conversation dan chat
+
+fitur chat:
+1. get history chat per conversationid: mendapatkan histori chat dengan mendukung fitur lazy load
+2. fitur chat stream: dimana menyimpan 1 chat user dan chat assistant dengan hit endpoint completition openrouter, ketika chat belum ada maka di create
+3. fitur upload S3: sudah sesuai dengan yang ada, ketika chat belum ada maka di create
+4. fitur chat stream dengan file: dimana menyimpan 1 chat user dan chat assistant dengan hit endpoint completition openrouter membawa link url file yang disisipkan frontend, ketika chat belum ada maka di create
+5. update chat, dimana akan mengubah dan menyimpan chat sebelumnya dan chat setelah di update dan bisa retry untuk mendapatkan response lain dengan prompt yang sama
+
+catatan: 
+1. saya ingin sebelum sebelum melakukan chat completition haru cek saldo dengan menghitung token input dengan token yang akan keluar dengan rumus output token 2 kali dari token input, apakah cukup
+2. jika kettik stream sudah melebihi saldo maka akan di hentikan
+3. ketika selesai completition jangan 
