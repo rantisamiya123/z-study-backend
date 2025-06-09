@@ -5,6 +5,7 @@ const openrouterService = require('./openrouter.service');
 const userService = require('./user.service');
 const settingService = require('./setting.service');
 const ApiError = require('../utils/error.util');
+const tokenCounter = require('../utils/tokenCounter.util');
 
 /**
  * Create a new chat message
@@ -121,14 +122,13 @@ const createChatPair = async ({
 };
 
 /**
- * Edit a user message and create new version with regenerated assistant response
+ * Edit a user message (creates new version, does NOT regenerate assistant response)
  * @param {string} chatId - Chat ID to edit
  * @param {string} newContent - New content for the message
  * @param {string} userId - User ID for authorization
- * @param {string} model - Model to use for regeneration
- * @returns {Promise<Object>} - Updated chat and new assistant response
+ * @returns {Promise<Object>} - Updated chat with versioning info
  */
-const editMessageAndRegenerate = async (chatId, newContent, userId, model) => {
+const editUserMessage = async (chatId, newContent, userId) => {
   try {
     // Get the chat to edit
     const chatToEdit = await getChatById(chatId, userId);
@@ -138,24 +138,120 @@ const editMessageAndRegenerate = async (chatId, newContent, userId, model) => {
     }
 
     // Create new version of the user message
-    const newUserVersion = await chatToEdit.createNewVersion(newContent, model);
+    const newUserVersion = await chatToEdit.createNewVersion(newContent);
 
     // Deactivate all messages after this point in the conversation
+    // This creates a branch point where the conversation can diverge
     await newUserVersion.deactivateFromPoint();
 
-    // Get conversation history up to this point for context
-    const conversationHistory = await getActiveConversationHistory(
-      newUserVersion.conversationId, 
-      newUserVersion.messageIndex + 1
+    // Get versioning information
+    const allVersions = await Chat.findVersionsByOriginalChatId(newUserVersion.originalChatId);
+    
+    return {
+      editedMessage: {
+        ...newUserVersion.toJSON(),
+        hasMultipleVersions: allVersions.length > 1,
+        totalVersions: allVersions.length,
+        availableVersions: allVersions.map(v => ({
+          versionNumber: v.versionNumber,
+          isCurrentVersion: v.isCurrentVersion,
+          createdAt: v.createdAt,
+          content: v.content.substring(0, 100) + (v.content.length > 100 ? '...' : '')
+        }))
+      },
+      branchInfo: {
+        branchCreated: true,
+        deactivatedMessagesCount: await newUserVersion.deactivateFromPoint(),
+        message: 'Message edited. Subsequent messages have been deactivated. You can generate a new response or switch between versions.'
+      }
+    };
+
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to edit user message');
+  }
+};
+
+/**
+ * Edit an assistant response (creates new version, no regeneration)
+ * @param {string} chatId - Chat ID to edit
+ * @param {string} newContent - New content for the response
+ * @param {string} userId - User ID for authorization
+ * @returns {Promise<Object>} - Updated chat with versioning info
+ */
+const editAssistantResponse = async (chatId, newContent, userId) => {
+  try {
+    // Get the chat to edit
+    const chatToEdit = await getChatById(chatId, userId);
+    
+    if (chatToEdit.role !== 'assistant') {
+      throw new ApiError(httpStatus.BAD_REQUEST, 'Can only edit assistant responses');
+    }
+
+    // Create new version of the assistant response
+    const newAssistantVersion = await chatToEdit.createNewVersion(newContent);
+
+    // Get versioning information
+    const allVersions = await Chat.findVersionsByOriginalChatId(newAssistantVersion.originalChatId);
+    
+    return {
+      editedResponse: {
+        ...newAssistantVersion.toJSON(),
+        hasMultipleVersions: allVersions.length > 1,
+        totalVersions: allVersions.length,
+        availableVersions: allVersions.map(v => ({
+          versionNumber: v.versionNumber,
+          isCurrentVersion: v.isCurrentVersion,
+          createdAt: v.createdAt,
+          content: v.content.substring(0, 100) + (v.content.length > 100 ? '...' : '')
+        }))
+      },
+      versionInfo: {
+        message: 'Response edited successfully. New version created.',
+        currentVersion: newAssistantVersion.versionNumber,
+        totalVersions: allVersions.length
+      }
+    };
+
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to edit assistant response');
+  }
+};
+
+/**
+ * Generate new assistant response for a user message with streaming
+ * @param {string} chatId - User chat ID to generate response for
+ * @param {string} userId - User ID for authorization
+ * @param {string} model - Model to use for generation
+ * @param {Object} res - Express response object for streaming
+ * @returns {Promise<void>} - Streams response directly to client
+ */
+const generateResponseForUserMessage = async (chatId, userId, model, res) => {
+  try {
+    // Get the user chat
+    const userChat = await getChatById(chatId, userId);
+    
+    if (userChat.role !== 'user') {
+      throw new ApiError(httpStatus.BAD_REQUEST, 'Can only generate response for user messages');
+    }
+
+    // Check if there's already an assistant response
+    const existingAssistantChat = await Chat.findByConversationId(userChat.conversationId, {
+      limit: 1000,
+      activeOnly: true,
+      currentVersionOnly: true
+    });
+    
+    const assistantResponse = existingAssistantChat.items.find(chat => 
+      chat.parentChatId === userChat.chatId && chat.role === 'assistant'
     );
 
-    // Prepare messages for OpenRouter
-    const messages = conversationHistory.map(chat => ({
-      role: chat.role,
-      content: chat.content
-    }));
-
-    // Generate new assistant response
+    // Check user balance
     const user = await userService.getUserById(userId);
     const models = await openrouterService.fetchModels();
     const selectedModel = models.find(m => m.id === model);
@@ -164,58 +260,161 @@ const editMessageAndRegenerate = async (chatId, newContent, userId, model) => {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Invalid model selected');
     }
 
-    // Check balance and generate response
-    const result = await openrouterService.createChatCompletion(userId, model, messages);
-    
-    // Calculate costs
+    // Get conversation history up to this user message
+    const conversationHistory = await getActiveConversationHistory(
+      userChat.conversationId, 
+      userChat.messageIndex + 1
+    );
+
+    // Prepare messages for OpenRouter
+    const messages = conversationHistory.map(chat => ({
+      role: chat.role,
+      content: chat.content
+    }));
+
+    // Estimate cost
+    const estimatedPromptTokens = tokenCounter.countTokens(messages);
+    const estimatedOutputTokens = Math.min(1000, selectedModel.context_length * 0.2);
     const exchangeRate = await settingService.getExchangeRate();
-    const { usage } = result;
-    const inputCostUSD = (usage.prompt_tokens / 1000) * selectedModel.pricing.prompt;
-    const outputCostUSD = (usage.completion_tokens / 1000) * selectedModel.pricing.completion;
-    const totalCostUSD = inputCostUSD + outputCostUSD;
-    const totalCostIDR = totalCostUSD * exchangeRate;
+    const estimatedInputCostUSD = (estimatedPromptTokens / 1000) * selectedModel.pricing.prompt;
+    const estimatedOutputCostUSD = (estimatedOutputTokens / 1000) * selectedModel.pricing.completion;
+    const estimatedTotalCostUSD = estimatedInputCostUSD + estimatedOutputCostUSD;
+    const estimatedTotalCostIDR = estimatedTotalCostUSD * exchangeRate;
 
-    // Deduct from user balance
-    await userService.updateBalance(userId, -totalCostIDR);
+    // Check balance
+    if (user.balance < estimatedTotalCostIDR) {
+      res.write(`data: ${JSON.stringify({ 
+        error: 'Insufficient balance for this operation',
+        required: estimatedTotalCostIDR,
+        current: user.balance
+      })}\n\n`);
+      return res.end();
+    }
 
-    // Create new assistant response
-    const assistantMessageIndex = await Chat.getNextMessageIndex(newUserVersion.conversationId);
-    const assistantChat = await Chat.create({
-      conversationId: newUserVersion.conversationId,
-      userId,
-      model,
-      role: 'assistant',
-      content: result.message.content,
-      parentChatId: newUserVersion.chatId,
-      messageIndex: assistantMessageIndex,
-      isActive: true,
-      isCurrentVersion: true,
-      versionNumber: 1,
-      promptTokens: usage.prompt_tokens,
-      completionTokens: usage.completion_tokens,
-      totalTokens: usage.total_tokens,
-      costUSD: totalCostUSD,
-      costIDR: totalCostIDR
+    // Start streaming
+    const { stream } = await openrouterService.createChatCompletionStream(
+      userId, model, messages
+    );
+
+    let responseText = '';
+    let usage = null;
+
+    stream.on('data', (chunk) => {
+      const data = chunk.toString();
+      const lines = data.split('\n').filter(line => line.trim().startsWith('data:'));
+
+      for (let line of lines) {
+        let dataSliced = line.trim().slice(5).trim();
+
+        while (dataSliced.startsWith('data:')) {
+          dataSliced = dataSliced.slice(5).trim();
+        }
+
+        try {
+          const parsedData = JSON.parse(dataSliced);
+
+          if (parsedData.usage) {
+            usage = parsedData.usage;
+          }
+
+          if (parsedData.choices && parsedData.choices[0].delta && parsedData.choices[0].delta.content) {
+            responseText += parsedData.choices[0].delta.content;
+          }
+
+          res.write(`data: ${JSON.stringify(parsedData)}\n\n`);
+        } catch (err) {
+          console.error('JSON parse error:', err.message, dataSliced);
+        }
+      }
+
+      if (res.flush) res.flush();
     });
 
-    // Update parent-child relationship
-    await newUserVersion.addChildChatId(assistantChat.chatId);
+    stream.on('end', async () => {
+      res.write('data: [DONE]\n\n');
 
-    return {
-      editedUserChat: newUserVersion,
-      newAssistantChat: assistantChat,
-      usage,
-      cost: {
-        usd: totalCostUSD,
-        idr: totalCostIDR
+      try {
+        if (usage) {
+          const { prompt_tokens, completion_tokens, total_tokens } = usage;
+          const inputCostUSD = (prompt_tokens / 1000) * selectedModel.pricing.prompt;
+          const outputCostUSD = (completion_tokens / 1000) * selectedModel.pricing.completion;
+          const totalCostUSD = inputCostUSD + outputCostUSD;
+          const totalCostIDR = totalCostUSD * exchangeRate;
+
+          // Deduct from user balance
+          await userService.updateBalance(userId, -totalCostIDR);
+
+          let newAssistantChat;
+
+          if (assistantResponse) {
+            // Create new version of existing assistant response
+            newAssistantChat = await assistantResponse.createNewVersion(responseText, model);
+            newAssistantChat.promptTokens = prompt_tokens;
+            newAssistantChat.completionTokens = completion_tokens;
+            newAssistantChat.totalTokens = total_tokens;
+            newAssistantChat.costUSD = totalCostUSD;
+            newAssistantChat.costIDR = totalCostIDR;
+            await newAssistantChat.save();
+          } else {
+            // Create new assistant response
+            const assistantMessageIndex = await Chat.getNextMessageIndex(userChat.conversationId);
+            newAssistantChat = await Chat.create({
+              conversationId: userChat.conversationId,
+              userId,
+              model,
+              role: 'assistant',
+              content: responseText,
+              parentChatId: userChat.chatId,
+              messageIndex: assistantMessageIndex,
+              isActive: true,
+              isCurrentVersion: true,
+              versionNumber: 1,
+              promptTokens: prompt_tokens,
+              completionTokens: completion_tokens,
+              totalTokens: total_tokens,
+              costUSD: totalCostUSD,
+              costIDR: totalCostIDR
+            });
+
+            // Update parent-child relationship
+            await userChat.addChildChatId(newAssistantChat.chatId);
+          }
+
+          // Get versioning info
+          const allVersions = await Chat.findVersionsByOriginalChatId(newAssistantChat.originalChatId);
+
+          res.write(`data: ${JSON.stringify({ 
+            usage, 
+            cost: { 
+              usd: totalCostUSD, 
+              idr: totalCostIDR 
+            },
+            assistantMessage: {
+              ...newAssistantChat.toJSON(),
+              hasMultipleVersions: allVersions.length > 1,
+              totalVersions: allVersions.length,
+              isNewVersion: assistantResponse ? true : false
+            }
+          })}\n\n`);
+        }
+      } catch (error) {
+        console.error('Error saving generated response:', error);
+        res.write(`data: ${JSON.stringify({ error: 'Error saving generated response' })}\n\n`);
       }
-    };
+
+      res.end();
+    });
+
+    stream.on('error', (error) => {
+      res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+      res.end();
+    });
 
   } catch (error) {
     if (error instanceof ApiError) {
       throw error;
     }
-    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to edit message and regenerate');
+    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to generate response');
   }
 };
 
@@ -243,9 +442,26 @@ const switchToVersion = async (originalChatId, versionNumber, userId) => {
     // Get the updated conversation thread
     const updatedThread = await getActiveConversationHistory(targetVersion.conversationId, 999999);
 
+    // Get versioning info
+    const allVersions = await Chat.findVersionsByOriginalChatId(targetVersion.originalChatId);
+
     return {
-      switchedToVersion: targetVersion,
-      conversationThread: updatedThread
+      switchedToVersion: {
+        ...targetVersion.toJSON(),
+        hasMultipleVersions: allVersions.length > 1,
+        totalVersions: allVersions.length,
+        availableVersions: allVersions.map(v => ({
+          versionNumber: v.versionNumber,
+          isCurrentVersion: v.isCurrentVersion,
+          createdAt: v.createdAt,
+          content: v.content.substring(0, 100) + (v.content.length > 100 ? '...' : '')
+        }))
+      },
+      conversationThread: updatedThread,
+      switchInfo: {
+        message: `Successfully switched to version ${versionNumber}`,
+        affectedMessages: updatedThread.length
+      }
     };
 
   } catch (error) {
@@ -277,7 +493,11 @@ const getChatVersions = async (originalChatId, userId) => {
       isCurrentVersion: version.isCurrentVersion,
       content: version.content,
       createdAt: version.createdAt,
-      versionHistory: version.versionHistory
+      updatedAt: version.updatedAt,
+      versionHistory: version.versionHistory,
+      contentPreview: version.content.substring(0, 200) + (version.content.length > 200 ? '...' : ''),
+      wordCount: version.content.split(' ').length,
+      characterCount: version.content.length
     }));
 
   } catch (error) {
@@ -285,91 +505,6 @@ const getChatVersions = async (originalChatId, userId) => {
       throw error;
     }
     throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to get chat versions');
-  }
-};
-
-/**
- * Regenerate assistant response for a message
- * @param {string} chatId - Assistant chat ID to regenerate
- * @param {string} userId - User ID for authorization
- * @param {string} model - Model to use for regeneration
- * @returns {Promise<Object>} - New assistant response
- */
-const regenerateAssistantResponse = async (chatId, userId, model) => {
-  try {
-    // Get the assistant chat to regenerate
-    const assistantChat = await getChatById(chatId, userId);
-    
-    if (assistantChat.role !== 'assistant') {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'Can only regenerate assistant messages');
-    }
-
-    // Create new version of the assistant response
-    const newAssistantVersion = await assistantChat.createNewVersion('', model);
-
-    // Get the parent user message
-    const userChat = await Chat.findById(assistantChat.parentChatId);
-    if (!userChat) {
-      throw new ApiError(httpStatus.NOT_FOUND, 'Parent user message not found');
-    }
-
-    // Get conversation history up to the user message
-    const conversationHistory = await getActiveConversationHistory(
-      userChat.conversationId, 
-      userChat.messageIndex + 1 // Include the user message
-    );
-
-    // Prepare messages for OpenRouter
-    const messages = conversationHistory.map(chat => ({
-      role: chat.role,
-      content: chat.content
-    }));
-
-    // Generate new assistant response
-    const user = await userService.getUserById(userId);
-    const models = await openrouterService.fetchModels();
-    const selectedModel = models.find(m => m.id === model);
-    
-    if (!selectedModel) {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'Invalid model selected');
-    }
-
-    const result = await openrouterService.createChatCompletion(userId, model, messages);
-    
-    // Calculate costs
-    const exchangeRate = await settingService.getExchangeRate();
-    const { usage } = result;
-    const inputCostUSD = (usage.prompt_tokens / 1000) * selectedModel.pricing.prompt;
-    const outputCostUSD = (usage.completion_tokens / 1000) * selectedModel.pricing.completion;
-    const totalCostUSD = inputCostUSD + outputCostUSD;
-    const totalCostIDR = totalCostUSD * exchangeRate;
-
-    // Deduct from user balance
-    await userService.updateBalance(userId, -totalCostIDR);
-
-    // Update the new version with the generated content
-    newAssistantVersion.content = result.message.content;
-    newAssistantVersion.promptTokens = usage.prompt_tokens;
-    newAssistantVersion.completionTokens = usage.completion_tokens;
-    newAssistantVersion.totalTokens = usage.total_tokens;
-    newAssistantVersion.costUSD = totalCostUSD;
-    newAssistantVersion.costIDR = totalCostIDR;
-    await newAssistantVersion.save();
-
-    return {
-      newAssistantChat: newAssistantVersion,
-      usage,
-      cost: {
-        usd: totalCostUSD,
-        idr: totalCostIDR
-      }
-    };
-
-  } catch (error) {
-    if (error instanceof ApiError) {
-      throw error;
-    }
-    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to regenerate assistant response');
   }
 };
 
@@ -396,11 +531,11 @@ const getActiveConversationHistory = async (conversationId, maxMessageIndex) => 
 };
 
 /**
- * Get chat history for a conversation with pagination
+ * Get chat history for a conversation with pagination and versioning info
  * @param {string} conversationId - Conversation ID
  * @param {string} userId - User ID (for authorization)
  * @param {Object} options - Query options (pagination)
- * @returns {Promise<Object>} - Paginated chats
+ * @returns {Promise<Object>} - Paginated chats with versioning info
  */
 const getConversationChats = async (conversationId, userId, options = {}) => {
   try {
@@ -436,18 +571,32 @@ const getConversationChats = async (conversationId, userId, options = {}) => {
           availableVersions: versions.map(v => ({
             versionNumber: v.versionNumber,
             isCurrentVersion: v.isCurrentVersion,
-            createdAt: v.createdAt
-          }))
+            createdAt: v.createdAt,
+            contentPreview: v.content.substring(0, 100) + (v.content.length > 100 ? '...' : '')
+          })),
+          editInfo: {
+            canEdit: true,
+            lastEditedAt: chat.updatedAt,
+            isEdited: chat.isEdited
+          }
         };
       })
     );
 
     return {
-      results: enhancedChats,
-      lastEvaluatedKey: result.lastEvaluatedKey,
-      limit,
-      totalResults: count,
-      hasMore: !!result.lastEvaluatedKey
+      success: true,
+      data: {
+        results: enhancedChats,
+        lastEvaluatedKey: result.lastEvaluatedKey,
+        limit,
+        totalResults: count,
+        hasMore: !!result.lastEvaluatedKey,
+        conversationInfo: {
+          conversationId,
+          totalMessages: count,
+          activeMessages: enhancedChats.length
+        }
+      }
     };
   } catch (error) {
     if (error instanceof ApiError) {
@@ -458,10 +607,10 @@ const getConversationChats = async (conversationId, userId, options = {}) => {
 };
 
 /**
- * Get a chat by ID
+ * Get a chat by ID with versioning information
  * @param {string} chatId - Chat ID
  * @param {string} userId - User ID (for authorization)
- * @returns {Promise<Chat>} - Chat
+ * @returns {Promise<Chat>} - Chat with versioning info
  */
 const getChatById = async (chatId, userId) => {
   try {
@@ -758,10 +907,11 @@ const getUserChatHistory = async (userId, options = {}) => {
 module.exports = {
   createChat,
   createChatPair,
-  editMessageAndRegenerate,
+  editUserMessage,
+  editAssistantResponse,
+  generateResponseForUserMessage,
   switchToVersion,
   getChatVersions,
-  regenerateAssistantResponse,
   getActiveConversationHistory,
   getConversationChats,
   getChatById,
