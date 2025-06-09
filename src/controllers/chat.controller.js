@@ -9,16 +9,13 @@ const catchAsync = require('../utils/catchAsync.util');
 const ApiError = require('../utils/error.util');
 const tokenCounter = require('../utils/tokenCounter.util');
 const { contextBuilder } = require('../utils/contextBuilder.util');
+
 /**
  * Get chat history for a conversation
  */
 const getConversationChats = catchAsync(async (req, res) => {
-    const {
-        conversationId
-    } = req.params;
-    const {
-        userId
-    } = req.user;
+    const { conversationId } = req.params;
+    const { userId } = req.user;
     const options = req.query;
 
     const chats = await chatService.getConversationChats(conversationId, userId, options);
@@ -29,12 +26,8 @@ const getConversationChats = catchAsync(async (req, res) => {
  * Get a chat by ID
  */
 const getChatById = catchAsync(async (req, res) => {
-    const {
-        chatId
-    } = req.params;
-    const {
-        userId
-    } = req.user;
+    const { chatId } = req.params;
+    const { userId } = req.user;
 
     const chat = await chatService.getChatById(chatId, userId);
     res.status(httpStatus.OK).send(chat);
@@ -44,12 +37,8 @@ const getChatById = catchAsync(async (req, res) => {
  * Update a chat
  */
 const updateChat = catchAsync(async (req, res) => {
-    const {
-        chatId
-    } = req.params;
-    const {
-        userId
-    } = req.user;
+    const { chatId } = req.params;
+    const { userId } = req.user;
     const updateData = req.body;
 
     const chat = await chatService.updateChat(chatId, updateData, userId);
@@ -57,31 +46,102 @@ const updateChat = catchAsync(async (req, res) => {
 });
 
 /**
+ * Edit a user message and regenerate assistant response
+ */
+const editMessage = catchAsync(async (req, res) => {
+    const { chatId } = req.params;
+    const { userId } = req.user;
+    const { content, model } = req.body;
+
+    if (!content) {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Content is required');
+    }
+
+    if (!model) {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Model is required');
+    }
+
+    const result = await chatService.editMessageAndRegenerate(chatId, content, userId, model);
+    
+    res.status(httpStatus.OK).send({
+        success: true,
+        data: result
+    });
+});
+
+/**
+ * Switch to a specific version of a chat
+ */
+const switchToVersion = catchAsync(async (req, res) => {
+    const { chatId } = req.params;
+    const { userId } = req.user;
+    const { versionNumber } = req.body;
+
+    if (!versionNumber || typeof versionNumber !== 'number') {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Version number is required and must be a number');
+    }
+
+    const result = await chatService.switchToVersion(chatId, versionNumber, userId);
+    
+    res.status(httpStatus.OK).send({
+        success: true,
+        data: result
+    });
+});
+
+/**
+ * Get all versions of a specific chat
+ */
+const getChatVersions = catchAsync(async (req, res) => {
+    const { chatId } = req.params;
+    const { userId } = req.user;
+
+    const versions = await chatService.getChatVersions(chatId, userId);
+    
+    res.status(httpStatus.OK).send({
+        success: true,
+        data: {
+            versions
+        }
+    });
+});
+
+/**
+ * Regenerate assistant response
+ */
+const regenerateResponse = catchAsync(async (req, res) => {
+    const { chatId } = req.params;
+    const { userId } = req.user;
+    const { model } = req.body;
+
+    if (!model) {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Model is required');
+    }
+
+    const result = await chatService.regenerateAssistantResponse(chatId, userId, model);
+    
+    res.status(httpStatus.OK).send({
+        success: true,
+        data: result
+    });
+});
+
+/**
  * Delete a chat
  */
 const deleteChat = catchAsync(async (req, res) => {
-    const {
-        chatId
-    } = req.params;
-    const {
-        userId
-    } = req.user;
+    const { chatId } = req.params;
+    const { userId } = req.user;
 
     await chatService.deleteChat(chatId, userId);
     res.status(httpStatus.NO_CONTENT).send();
 });
 
-// chat.controller
 /**
  * Create a chat completion
  */
 const chatCompletion = catchAsync(async (req, res) => {
-    const {
-        model,
-        messages,
-        max_tokens,
-        conversationId
-    } = req.body;
+    const { model, messages, max_tokens, conversationId } = req.body;
     const { userId } = req.user;
 
     try {
@@ -98,18 +158,24 @@ const chatCompletion = catchAsync(async (req, res) => {
         // Find or create conversation
         const conversation = await conversationService.findOrCreateConversation(userId, conversationId);
 
-        // Retrieve conversation history and build context-aware messages
-        const contextEnrichedMessages = await contextBuilder.buildMessagesWithContext({
-            userId,
-            conversationId: conversation.conversationId,
-            currentMessages: messages,
-            model: selectedModel,
-            maxContextTokens: selectedModel.contextWindow || 4096,
-            reserveTokens: max_tokens || 1000
-        });
+        // Get active conversation history for context
+        const conversationHistory = await chatService.getActiveConversationHistory(
+            conversation.conversationId,
+            999999 // Get all history
+        );
 
-        // Estimate tokens and cost with the enhanced context
-        const estimatedPromptTokens = tokenCounter.countTokens(contextEnrichedMessages);
+        // Build context-aware messages
+        const contextMessages = conversationHistory.map(chat => ({
+            role: chat.role,
+            content: chat.content
+        }));
+
+        // Add current user message
+        const userMessage = messages[messages.length - 1];
+        contextMessages.push(userMessage);
+
+        // Estimate tokens and cost
+        const estimatedPromptTokens = tokenCounter.countTokens(contextMessages);
         const estimatedOutputTokens = max_tokens || Math.min(1000, selectedModel.contextWindow * 0.2);
 
         // Calculate estimated cost
@@ -124,23 +190,18 @@ const chatCompletion = catchAsync(async (req, res) => {
             throw new ApiError(httpStatus.BAD_REQUEST, 'Insufficient balance for this operation');
         }
 
-        // Create chat completion (non-streaming)
+        // Create chat completion
         const result = await openrouterService.createChatCompletion(
             userId, 
             model, 
-            contextEnrichedMessages, 
+            contextMessages, 
             { max_tokens }
         );
 
         // Calculate final cost based on actual usage
         const { usage, model: modelDetails } = result;
-        const {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens
-        } = usage;
+        const { prompt_tokens, completion_tokens, total_tokens } = usage;
         
-        // Use the model details returned from service for accurate pricing
         const inputCostUSD = (prompt_tokens / 1000) * modelDetails.pricing.prompt;
         const outputCostUSD = (completion_tokens / 1000) * modelDetails.pricing.completion;
         const totalCostUSD = inputCostUSD + outputCostUSD;
@@ -149,19 +210,19 @@ const chatCompletion = catchAsync(async (req, res) => {
         // Deduct from user balance
         await userService.updateBalance(userId, -totalCostIDR);
 
-        // Record the chat
-        await chatService.recordChatUsage({
-            userId,
+        // Create chat pair (user message + assistant response)
+        const chatPair = await chatService.createChatPair({
             conversationId: conversation.conversationId,
+            userId,
             model,
-            promptTokens: prompt_tokens,
-            completionTokens: completion_tokens,
-            totalTokens: total_tokens,
-            costUSD: totalCostUSD,
-            costIDR: totalCostIDR,
-            content: {
-                prompt: messages, // Store original user message without context for clarity
-                response: result.message.content
+            userContent: userMessage.content,
+            assistantContent: result.message.content,
+            usage: {
+                promptTokens: prompt_tokens,
+                completionTokens: completion_tokens,
+                totalTokens: total_tokens,
+                costUSD: totalCostUSD,
+                costIDR: totalCostIDR
             }
         });
 
@@ -170,7 +231,8 @@ const chatCompletion = catchAsync(async (req, res) => {
             success: true,
             data: {
                 id: result.id,
-                message: result.message,
+                userMessage: chatPair.userChat,
+                assistantMessage: chatPair.assistantChat,
                 conversation: {
                     _id: conversation.conversationId,
                     title: conversation.title
@@ -197,19 +259,11 @@ const chatCompletion = catchAsync(async (req, res) => {
     }
 });
 
-
-// chat.controller.js
 /**
  * Create a chat completion (stream)
  */
 const chatCompletionStream = catchAsync(async (req, res) => {
-    const {
-        model,
-        messages, // This will be the new format with chatHistory
-        max_tokens,
-        conversationId,
-        chatHistory = [] // New: Frontend sends complete chat history
-    } = req.body;
+    const { model, messages, max_tokens, conversationId } = req.body;
     const { userId } = req.user;
 
     // Headers for SSE
@@ -241,28 +295,24 @@ const chatCompletionStream = catchAsync(async (req, res) => {
             messages
         );
 
-        // NEW: Apply token optimization to chatHistory
-        const tokenOptimizer = require('../services/tokenOptimizer.service');
-        const optimizedChatHistory = await tokenOptimizer.optimizeChatHistory({
-            chatHistory,
-            model: selectedModel,
-            maxContextTokens: selectedModel.contextWindow || 4096,
-            reserveTokens: max_tokens || 1000
-        });
+        // Get active conversation history for context
+        const conversationHistory = await chatService.getActiveConversationHistory(
+            conversation.conversationId,
+            999999 // Get all history
+        );
 
-        // Build context-aware messages using optimized history
-        const contextEnrichedMessages = await contextBuilder.buildMessagesWithOptimizedHistory({
-            userId,
-            conversationId: conversation.conversationId,
-            currentMessages: messages,
-            optimizedHistory: optimizedChatHistory,
-            model: selectedModel,
-            maxContextTokens: selectedModel.contextWindow || 4096,
-            reserveTokens: max_tokens || 1000
-        });
+        // Build context-aware messages
+        const contextMessages = conversationHistory.map(chat => ({
+            role: chat.role,
+            content: chat.content
+        }));
+
+        // Add current user message
+        const userMessage = messages[messages.length - 1];
+        contextMessages.push(userMessage);
 
         // Estimate tokens and cost
-        const estimatedPromptTokens = tokenCounter.countTokens(contextEnrichedMessages);
+        const estimatedPromptTokens = tokenCounter.countTokens(contextMessages);
         const estimatedOutputTokens = max_tokens || Math.min(1000, selectedModel.contextWindow * 0.2);
 
         // Calculate estimated cost
@@ -282,7 +332,7 @@ const chatCompletionStream = catchAsync(async (req, res) => {
         const { stream: responseStream } = await openrouterService.createChatCompletionStream(
             userId, 
             model, 
-            contextEnrichedMessages, 
+            contextMessages, 
             { max_tokens }
         );
         
@@ -326,11 +376,7 @@ const chatCompletionStream = catchAsync(async (req, res) => {
 
             try {
                 if (usage) {
-                    const {
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens
-                    } = usage;
+                    const { prompt_tokens, completion_tokens, total_tokens } = usage;
 
                     const inputCostUSD = (prompt_tokens / 1000) * selectedModel.pricing.prompt;
                     const outputCostUSD = (completion_tokens / 1000) * selectedModel.pricing.completion;
@@ -340,15 +386,13 @@ const chatCompletionStream = catchAsync(async (req, res) => {
                     // Deduct from user balance
                     await userService.updateBalance(userId, -totalCostIDR);
 
-                    // NEW: Process chat history updates and save new chat
-                    const { processChatHistoryUpdates } = require('../services/chat.service');
-                    const chatResults = await processChatHistoryUpdates({
-                        userId,
+                    // Create chat pair (user message + assistant response)
+                    const chatPair = await chatService.createChatPair({
                         conversationId: conversation.conversationId,
-                        chatHistory,
-                        newUserMessage: messages[messages.length - 1], // Last message should be user's new message
-                        assistantResponse: responseText,
+                        userId,
                         model,
+                        userContent: userMessage.content,
+                        assistantContent: responseText,
                         usage: {
                             promptTokens: prompt_tokens,
                             completionTokens: completion_tokens,
@@ -368,16 +412,8 @@ const chatCompletionStream = catchAsync(async (req, res) => {
                             usd: totalCostUSD, 
                             idr: totalCostIDR 
                         },
-                        newChats: {
-                            userChat: chatResults.userChat,
-                            assistantChat: chatResults.assistantChat
-                        },
-                        optimizationInfo: {
-                            originalHistoryLength: chatHistory.length,
-                            optimizedHistoryLength: optimizedChatHistory.length,
-                            tokensSaved: tokenCounter.countTokens(chatHistory.map(c => ({role: c.role, content: c.content}))) - tokenCounter.countTokens(optimizedChatHistory.map(c => ({role: c.role, content: c.content}))),
-                            updatedChatsCount: chatResults.updatedChats
-                        }
+                        userMessage: chatPair.userChat,
+                        assistantMessage: chatPair.assistantChat
                     })}\n\n`);
                 }
             } catch (error) {
@@ -414,16 +450,8 @@ const chatCompletionStream = catchAsync(async (req, res) => {
  * Process file with chat completion (stream)
  */
 const processFileStream = catchAsync(async (req, res) => {
-    const {
-        fileId,
-        model,
-        prompt,
-        max_tokens,
-        conversationId
-    } = req.body;
-    const {
-        userId
-    } = req.user;
+    const { fileId, model, prompt, max_tokens, conversationId } = req.body;
+    const { userId } = req.user;
 
     // Headers for SSE
     res.setHeader('Content-Type', 'text/event-stream');
@@ -487,7 +515,6 @@ const processFileStream = catchAsync(async (req, res) => {
         // For image models, we use a fixed token estimate
         let estimatedPromptTokens = 0;
         if (file.fileType === 'image') {
-            // Rough estimate for image tokens (varies by image size)
             estimatedPromptTokens = 100 + tokenCounter.countTokensForString(prompt);
         } else {
             estimatedPromptTokens = tokenCounter.countTokens(messages);
@@ -509,12 +536,8 @@ const processFileStream = catchAsync(async (req, res) => {
         }
 
         // Start streaming
-        const {
-            stream
-        } = await openrouterService.createChatCompletionStream(
-            userId, model, messages, {
-                max_tokens
-            }
+        const { stream } = await openrouterService.createChatCompletionStream(
+            userId, model, messages, { max_tokens }
         );
 
         let responseText = '';
@@ -544,13 +567,11 @@ const processFileStream = catchAsync(async (req, res) => {
 
                 // Check balance during streaming
                 if (responseText.length % 100 === 0) {
-                    // Re-estimate cost based on current response length
                     const currentOutputTokens = tokenCounter.countTokensForString(responseText);
                     const currentOutputCostUSD = (currentOutputTokens / 1000) * selectedModel.outputPricePer1000Tokens;
                     const currentTotalCostUSD = estimatedInputCostUSD + currentOutputCostUSD;
                     const currentTotalCostIDR = currentTotalCostUSD * exchangeRate;
 
-                    // If cost exceeds balance, stop the stream
                     if (currentTotalCostIDR > user.balance) {
                         throw new Error('Balance depleted during streaming');
                     }
@@ -559,7 +580,6 @@ const processFileStream = catchAsync(async (req, res) => {
                 // Forward to client
                 res.write(`data: ${data}\n\n`);
             } catch (error) {
-                // Stop streaming if an error occurs
                 stream.destroy();
 
                 if (error.message === 'Balance depleted during streaming') {
@@ -574,11 +594,7 @@ const processFileStream = catchAsync(async (req, res) => {
             try {
                 if (usage) {
                     // Calculate final cost
-                    const {
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens
-                    } = usage;
+                    const { prompt_tokens, completion_tokens, total_tokens } = usage;
                     const inputCostUSD = (prompt_tokens / 1000) * selectedModel.inputPricePer1000Tokens;
                     const outputCostUSD = (completion_tokens / 1000) * selectedModel.outputPricePer1000Tokens;
                     const totalCostUSD = inputCostUSD + outputCostUSD;
@@ -587,28 +603,30 @@ const processFileStream = catchAsync(async (req, res) => {
                     // Deduct from user balance
                     await userService.updateBalance(userId, -totalCostIDR);
 
-                    // Record the chat
-                    await chatService.recordChatUsage({
-                        userId,
+                    // Create chat pair for file processing
+                    const chatPair = await chatService.createChatPair({
                         conversationId: conversation.conversationId,
+                        userId,
                         model,
-                        promptTokens: prompt_tokens,
-                        completionTokens: completion_tokens,
-                        totalTokens: total_tokens,
-                        costUSD: totalCostUSD,
-                        costIDR: totalCostIDR,
-                        content: {
-                            prompt,
-                            response: responseText
-                        },
-                        filesUrl: [file.fileUrl]
+                        userContent: prompt,
+                        assistantContent: responseText,
+                        filesUrl: [file.fileUrl],
+                        usage: {
+                            promptTokens: prompt_tokens,
+                            completionTokens: completion_tokens,
+                            totalTokens: total_tokens,
+                            costUSD: totalCostUSD,
+                            costIDR: totalCostIDR
+                        }
                     });
 
                     // Send final usage info
                     res.write(`event: usage\ndata: ${JSON.stringify({ 
-            usage, 
-            cost: { usd: totalCostUSD, idr: totalCostIDR } 
-          })}\n\n`);
+                        usage, 
+                        cost: { usd: totalCostUSD, idr: totalCostIDR },
+                        userMessage: chatPair.userChat,
+                        assistantMessage: chatPair.assistantChat
+                    })}\n\n`);
                 }
 
                 res.end();
@@ -641,34 +659,59 @@ const processFileStream = catchAsync(async (req, res) => {
  * Retry a chat with the same prompt
  */
 const retryChat = catchAsync(async (req, res) => {
-    const {
-        chatId
-    } = req.params;
-    const {
-        userId
-    } = req.user;
+    const { chatId } = req.params;
+    const { userId } = req.user;
+    const { model } = req.body;
+
+    if (!model) {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Model is required');
+    }
 
     // Get the original chat
     const chat = await chatService.getChatById(chatId, userId);
 
-    // Extract the original prompt
-    const prompt = chat.content.prompt;
-
-    // Call the streaming endpoint with the same prompt
-    req.body = {
-        model: chat.model,
-        messages: prompt,
-        conversationId: chat.conversationId
-    };
-
-    // Forward to the streaming handler
-    return chatCompletionStream(req, res);
+    if (chat.role === 'assistant') {
+        // If it's an assistant message, regenerate it
+        const result = await chatService.regenerateAssistantResponse(chatId, userId, model);
+        return res.status(httpStatus.OK).send({
+            success: true,
+            data: result
+        });
+    } else if (chat.role === 'user') {
+        // If it's a user message, regenerate the assistant response
+        // Find the assistant response that follows this user message
+        const conversationChats = await chatService.getConversationChats(
+            chat.conversationId, 
+            userId, 
+            { activeOnly: true, currentVersionOnly: true }
+        );
+        
+        const assistantChat = conversationChats.results.find(c => 
+            c.parentChatId === chat.chatId && c.role === 'assistant'
+        );
+        
+        if (assistantChat) {
+            const result = await chatService.regenerateAssistantResponse(assistantChat.chatId, userId, model);
+            return res.status(httpStatus.OK).send({
+                success: true,
+                data: result
+            });
+        } else {
+            throw new ApiError(httpStatus.NOT_FOUND, 'No assistant response found to regenerate');
+        }
+    } else {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Invalid chat type for retry');
+    }
 });
 
 module.exports = {
     getConversationChats,
     getChatById,
     updateChat,
+    editMessage,
+    switchToVersion,
+    getChatVersions,
+    regenerateResponse,
     deleteChat,
     chatCompletionStream,
     processFileStream,

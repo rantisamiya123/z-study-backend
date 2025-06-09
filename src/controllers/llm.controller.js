@@ -40,6 +40,41 @@ const getModels = catchAsync(async (req, res) => {
   });
 });
 
+const getModelMarketing = catchAsync(async (req, res) => {
+  const {
+    search = '',
+    providers = '',
+    modelIds = '',
+    category = '',
+    page = 1,
+    limit = 20,
+    maxModels = 100
+  } = req.query;
+
+  // Parse providers dari comma-separated string (openai, deepseek, claude, dll)
+  const providerFilters = providers ? providers.split(',').map(p => p.trim().toLowerCase()).filter(Boolean) : [];
+  
+  // Parse model IDs dari comma-separated string
+  const modelIdFilters = modelIds ? modelIds.split(',').map(id => id.trim()).filter(Boolean) : [];
+
+  const options = {
+    search: search.trim(),
+    providers: providerFilters,
+    modelIds: modelIdFilters,
+    category: category.trim(),
+    page: parseInt(page),
+    limit: Math.min(parseInt(limit), 50), // maksimal 50 per halaman
+    maxModels: Math.min(parseInt(maxModels), 500) // maksimal 500 total models
+  };
+
+  const result = await openrouterService.searchModelMarketing(options);
+  
+  res.status(httpStatus.OK).send({ 
+    success: true, 
+    data: result
+  });
+});
+
 /**
  * Chat completion (non-streaming)
  */
@@ -318,6 +353,7 @@ const processFileStream = catchAsync(async (req, res) => {
 
 module.exports = {
   getModels,
+  getModelMarketing,
   chatCompletion,
   chatCompletionStream,
   uploadFile,

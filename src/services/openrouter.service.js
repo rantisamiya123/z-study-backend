@@ -189,6 +189,204 @@ const searchModels = async (options = {}) => {
 };
 
 /**
+ * Fetch and process models from OpenRouter for marketing purposes with advanced filtering
+ * @param {Object} options - Query options
+ * @param {string} options.search - Search query for model name
+ * @param {Array} options.providers - Array of provider filters (openai, deepseek, claude, etc)
+ * @param {Array} options.modelIds - Array of specific model IDs to search
+ * @param {string} options.category - Category filter from OpenRouter
+ * @param {number} options.page - Page number
+ * @param {number} options.limit - Items per page
+ * @param {number} options.maxModels - Maximum total models to return
+ * @returns {Promise<Object>} Processed models data with pagination
+ */
+const searchModelMarketing = async (options = {}) => {
+  try {
+    const {
+      search = '',
+      providers = [],
+      modelIds = [],
+      category = '',
+      page = 1,
+      limit = 20,
+      maxModels = 100
+    } = options;
+
+    // Check cache validity (cache for 1 hour)
+    const now = Date.now();
+    let allModels;
+    
+    if (MODELS_CACHE.data && now - MODELS_CACHE.timestamp < 3600000) {
+      allModels = MODELS_CACHE.data;
+    } else {
+      // Fetch models from OpenRouter
+      const response = await axios.get('https://openrouter.ai/api/v1/models', {
+        headers: {
+          Authorization: `Bearer ${openrouter.API_KEY}`
+        }
+      });
+
+      allModels = response.data.data;
+      MODELS_CACHE.data = allModels;
+      MODELS_CACHE.timestamp = now;
+    }
+
+    // Apply filters
+    let filteredModels = allModels;
+
+    // 1. Filter by specific model IDs (exact match)
+    if (modelIds.length > 0) {
+      filteredModels = filteredModels.filter(model => 
+        modelIds.some(id => model.id.toLowerCase().includes(id.toLowerCase()))
+      );
+    }
+
+    // 2. Filter by providers (openai, deepseek, claude, etc)
+    if (providers.length > 0) {
+      filteredModels = filteredModels.filter(model => {
+        const modelProvider = model.id.split('/')[0]?.toLowerCase() || '';
+        const modelName = model.name.toLowerCase();
+        
+        return providers.some(provider => {
+          switch(provider) {
+            case 'openai':
+              return modelProvider === 'openai' || modelName.includes('gpt') || modelName.includes('openai');
+            case 'deepseek':
+              return modelProvider.includes('deepseek') || modelName.includes('deepseek');
+            case 'claude':
+              return modelProvider === 'anthropic' || modelName.includes('claude');
+            case 'google':
+              return modelProvider === 'google' || modelName.includes('gemini') || modelName.includes('palm');
+            case 'meta':
+              return modelProvider === 'meta' || modelName.includes('llama');
+            case 'mistral':
+              return modelProvider === 'mistral' || modelName.includes('mistral');
+            default:
+              return modelProvider.includes(provider) || modelName.includes(provider);
+          }
+        });
+      });
+    }
+
+    // 3. Filter by search term (nama model)
+    if (search) {
+      const searchLower = search.toLowerCase();
+      filteredModels = filteredModels.filter(model => 
+        model.name.toLowerCase().includes(searchLower) ||
+        model.id.toLowerCase().includes(searchLower) ||
+        model.description?.toLowerCase().includes(searchLower)
+      );
+    }
+
+    // 4. Filter by category (berdasarkan modality atau architecture)
+    if (category) {
+      const categoryLower = category.toLowerCase();
+      filteredModels = filteredModels.filter(model => {
+        const modality = model.architecture?.modality?.toLowerCase() || '';
+        const inputModalities = model.architecture?.input_modalities?.join(',').toLowerCase() || '';
+        const outputModalities = model.architecture?.output_modalities?.join(',').toLowerCase() || '';
+        
+        return modality.includes(categoryLower) || 
+               inputModalities.includes(categoryLower) || 
+               outputModalities.includes(categoryLower) ||
+               (categoryLower === 'text' && modality.includes('text')) ||
+               (categoryLower === 'multimodal' && (inputModalities.includes('image') || inputModalities.includes('file'))) ||
+               (categoryLower === 'vision' && inputModalities.includes('image')) ||
+               (categoryLower === 'code' && (model.name.toLowerCase().includes('code') || model.description?.toLowerCase().includes('coding')));
+      });
+    }
+
+    // 5. Apply maxModels limit
+    if (maxModels && filteredModels.length > maxModels) {
+      filteredModels = filteredModels.slice(0, maxModels);
+    }
+
+    // 6. Sort models (default by name)
+    filteredModels.sort((a, b) => {
+      // Prioritas: OpenAI > Anthropic > Google > Meta > lainnya
+      const providerPriority = {
+        'openai': 1,
+        'anthropic': 2,
+        'google': 3,
+        'meta': 4
+      };
+      
+      const aProvider = a.id.split('/')[0]?.toLowerCase() || '';
+      const bProvider = b.id.split('/')[0]?.toLowerCase() || '';
+      
+      const aPriority = providerPriority[aProvider] || 99;
+      const bPriority = providerPriority[bProvider] || 99;
+      
+      if (aPriority !== bPriority) {
+        return aPriority - bPriority;
+      }
+      
+      return a.name.localeCompare(b.name);
+    });
+
+    // 7. Apply pagination
+    const totalItems = filteredModels.length;
+    const totalPages = Math.ceil(totalItems / limit);
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const paginatedModels = filteredModels.slice(startIndex, endIndex);
+
+    // 8. Format response data
+    const formattedModels = paginatedModels.map(model => ({
+      id: model.id,
+      name: model.name,
+      provider: model.id.split('/')[0] || 'unknown',
+      description: model.description || '',
+      created: model.created,
+      context_length: model.context_length,
+      modality: model.architecture?.modality || '',
+      input_modalities: model.architecture?.input_modalities || [],
+      output_modalities: model.architecture?.output_modalities || [],
+      pricing: {
+        prompt: parseFloat(model.pricing?.prompt || 0),
+        completion: parseFloat(model.pricing?.completion || 0),
+        image: parseFloat(model.pricing?.image || 0)
+      },
+      features: {
+        supports_tools: model.supported_parameters?.includes('tools') || false,
+        supports_vision: model.architecture?.input_modalities?.includes('image') || false,
+        supports_files: model.architecture?.input_modalities?.includes('file') || false,
+        max_tokens: model.top_provider?.max_completion_tokens || null
+      }
+    }));
+
+    const result = {
+      models: formattedModels,
+      pagination: {
+        current_page: page,
+        total_pages: totalPages,
+        total_items: totalItems,
+        items_per_page: limit,
+        has_next: page < totalPages,
+        has_prev: page > 1
+      },
+      filters_applied: {
+        search: search || null,
+        providers: providers.length > 0 ? providers : null,
+        model_ids: modelIds.length > 0 ? modelIds : null,
+        category: category || null,
+        max_models: maxModels
+      },
+      summary: {
+        total_filtered: totalItems,
+        providers_found: [...new Set(formattedModels.map(m => m.provider))],
+        categories_found: [...new Set(formattedModels.map(m => m.modality).filter(Boolean))]
+      }
+    };
+
+    return result;
+  } catch (error) {
+    logger.error('Error fetching marketing models from OpenRouter:', error);
+    throw new ApiError(httpStatus.SERVICE_UNAVAILABLE, 'Failed to fetch marketing models data');
+  }
+};
+
+/**
  * Validate model and check user balance
  * @param {string} userId - User ID
  * @param {string} model - Model ID
@@ -317,7 +515,7 @@ const createChatCompletion = async (userId, model, messages, options = {}) => {
 
 /**
  * Generate conversation title using a free model
- * @param {Array} messages - The conversation messages to summarize
+ * @param {String} messages - The conversation messages to summarize
  * @returns {Promise<string>} - Generated title
  */
 const generateConversationTitle = async (messages) => {
@@ -326,7 +524,7 @@ const generateConversationTitle = async (messages) => {
     const FREE_MODEL = 'meta-llama/llama-3.2-3b-instruct:free'; // Adjust based on available free models
     
     // Extract the first user message for context
-    const firstUserMessage = messages.find(msg => msg.role === 'user');
+    const firstUserMessage = messages.content;
     if (!firstUserMessage) {
       return 'New Conversation';
     }
@@ -392,7 +590,7 @@ const createChatCompletionStream = async (userId, model, messages, options = {})
   try {
     // Validate model, user balance, etc.
     const validation = await validateModelAndBalance(userId, model, messages, options.max_tokens);
-
+    
     // Setup streaming request to OpenRouter
     const response = await axios.post(
       openrouter.ENDPOINT,
@@ -533,5 +731,6 @@ module.exports = {
   createChatCompletionStream,
   processFileWithLLM,
   processFileWithLLMStream,
-  generateConversationTitle
+  generateConversationTitle,
+  searchModelMarketing 
 };

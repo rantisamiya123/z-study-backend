@@ -25,6 +25,34 @@ router.patch(
   chatController.updateChat
 );
 
+// Edit a user message and regenerate assistant response
+router.put(
+  '/:chatId/edit',
+  auth(),
+  chatController.editMessage
+);
+
+// Switch to a specific version of a chat
+router.post(
+  '/:chatId/switch-version',
+  auth(),
+  chatController.switchToVersion
+);
+
+// Get all versions of a specific chat
+router.get(
+  '/:chatId/versions',
+  auth(),
+  chatController.getChatVersions
+);
+
+// Regenerate assistant response
+router.post(
+  '/:chatId/regenerate',
+  auth(),
+  chatController.regenerateResponse
+);
+
 // Delete a chat
 router.delete(
   '/:chatId',
@@ -32,6 +60,7 @@ router.delete(
   chatController.deleteChat
 );
 
+// Chat completion (non-streaming)
 router.post(
   '/completion',
   auth(),

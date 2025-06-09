@@ -175,6 +175,7 @@
           "chats": [{
             "chatId": "string",
             "model": "string",
+            "role": "string (user/assistant)",
             "promptTokens": "number",
             "completionTokens": "number",
             "totalTokens": "number",
@@ -190,6 +191,351 @@
         }
       },
       "description": "Mendapatkan riwayat penggunaan LLM oleh pengguna"
+    }
+  },
+  "conversations": {
+    "getUserConversations": {
+      "url": "/api/conversations",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "query": {
+        "page": "number, optional, default: 1",
+        "limit": "number, optional, default: 20"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "results": [{
+            "conversationId": "string",
+            "title": "string",
+            "lastMessageAt": "date",
+            "createdAt": "date"
+          }],
+          "page": "number",
+          "limit": "number",
+          "totalPages": "number",
+          "totalResults": "number"
+        }
+      },
+      "description": "Mendapatkan daftar percakapan pengguna"
+    },
+    "getConversationById": {
+      "url": "/api/conversations/{conversationId}",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "conversationId": "string",
+          "title": "string",
+          "lastMessageAt": "date",
+          "createdAt": "date"
+        }
+      },
+      "description": "Mendapatkan detail percakapan berdasarkan ID"
+    },
+    "updateConversation": {
+      "url": "/api/conversations/{conversationId}",
+      "method": "PATCH",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "title": "string, optional"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "conversationId": "string",
+          "title": "string",
+          "lastMessageAt": "date",
+          "updatedAt": "date"
+        }
+      },
+      "description": "Memperbarui judul percakapan"
+    },
+    "deleteConversation": {
+      "url": "/api/conversations/{conversationId}",
+      "method": "DELETE",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "response": {
+        "success": true,
+        "message": "Conversation deleted successfully"
+      },
+      "description": "Menghapus percakapan dan semua pesan di dalamnya"
+    }
+  },
+  "chat": {
+    "getConversationChats": {
+      "url": "/api/chat/conversation/{conversationId}",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "query": {
+        "limit": "number, optional, default: 20",
+        "lastEvaluatedKey": "string, optional",
+        "sortOrder": "string, optional (asc/desc), default: asc",
+        "activeOnly": "boolean, optional, default: true",
+        "currentVersionOnly": "boolean, optional, default: true"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "results": [{
+            "chatId": "string",
+            "role": "string (user/assistant)",
+            "content": "string",
+            "messageIndex": "number",
+            "isActive": "boolean",
+            "isEdited": "boolean",
+            "editHistory": "array",
+            "parentChatId": "string",
+            "childChatIds": "array",
+            "versionId": "string",
+            "originalChatId": "string",
+            "versionNumber": "number",
+            "isCurrentVersion": "boolean",
+            "hasMultipleVersions": "boolean",
+            "totalVersions": "number",
+            "availableVersions": "array",
+            "createdAt": "date",
+            "updatedAt": "date"
+          }],
+          "lastEvaluatedKey": "string",
+          "hasMore": "boolean"
+        }
+      },
+      "description": "Mendapatkan riwayat chat dalam percakapan dengan pagination dan informasi versioning"
+    },
+    "getChatById": {
+      "url": "/api/chat/{chatId}",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "chatId": "string",
+          "role": "string (user/assistant)",
+          "content": "string",
+          "messageIndex": "number",
+          "isActive": "boolean",
+          "isEdited": "boolean",
+          "editHistory": "array",
+          "parentChatId": "string",
+          "childChatIds": "array",
+          "versionId": "string",
+          "originalChatId": "string",
+          "versionNumber": "number",
+          "isCurrentVersion": "boolean",
+          "createdAt": "date",
+          "updatedAt": "date"
+        }
+      },
+      "description": "Mendapatkan detail chat berdasarkan ID dengan informasi versioning"
+    },
+    "editMessage": {
+      "url": "/api/chat/{chatId}/edit",
+      "method": "PUT",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "content": "string, required",
+        "model": "string, required"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "editedUserChat": "object",
+          "newAssistantChat": "object",
+          "usage": "object",
+          "cost": {
+            "usd": "number",
+            "idr": "number"
+          }
+        }
+      },
+      "description": "Edit pesan user, membuat versi baru, dan regenerate response assistant"
+    },
+    "switchToVersion": {
+      "url": "/api/chat/{chatId}/switch-version",
+      "method": "POST",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "versionNumber": "number, required"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "switchedToVersion": "object",
+          "conversationThread": "array"
+        }
+      },
+      "description": "Beralih ke versi tertentu dari chat dan mengatur ulang timeline percakapan"
+    },
+    "getChatVersions": {
+      "url": "/api/chat/{chatId}/versions",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "versions": [{
+            "chatId": "string",
+            "versionId": "string",
+            "versionNumber": "number",
+            "isCurrentVersion": "boolean",
+            "content": "string",
+            "createdAt": "date",
+            "versionHistory": "array"
+          }]
+        }
+      },
+      "description": "Mendapatkan semua versi dari chat tertentu"
+    },
+    "regenerateResponse": {
+      "url": "/api/chat/{chatId}/regenerate",
+      "method": "POST",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "model": "string, required"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "newAssistantChat": "object",
+          "usage": "object",
+          "cost": {
+            "usd": "number",
+            "idr": "number"
+          }
+        }
+      },
+      "description": "Regenerate response assistant untuk pesan tertentu dengan membuat versi baru"
+    },
+    "chatCompletion": {
+      "url": "/api/chat/completion",
+      "method": "POST",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "model": "string, required",
+        "messages": "array, required",
+        "max_tokens": "number, optional",
+        "conversationId": "string, optional"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "id": "string",
+          "userMessage": "object",
+          "assistantMessage": "object",
+          "conversation": "object",
+          "usage": "object",
+          "cost": {
+            "usd": "number",
+            "idr": "number"
+          }
+        }
+      },
+      "description": "Membuat chat completion (non-streaming) dengan versioning support"
+    },
+    "chatCompletionStream": {
+      "url": "/api/chat/stream",
+      "method": "POST",
+      "headers": {
+        "Authorization": "Bearer {token}",
+        "Content-Type": "application/json"
+      },
+      "payload": {
+        "model": "string, required",
+        "messages": "array, required",
+        "max_tokens": "number, optional",
+        "conversationId": "string, optional"
+      },
+      "response": "Server-Sent Events (SSE) stream",
+      "description": "Membuat chat completion dengan streaming response dan versioning support"
+    },
+    "processFileStream": {
+      "url": "/api/chat/process-file/stream",
+      "method": "POST",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "fileId": "string, required",
+        "model": "string, required",
+        "prompt": "string, required",
+        "max_tokens": "number, optional",
+        "conversationId": "string, optional"
+      },
+      "response": "Server-Sent Events (SSE) stream",
+      "description": "Memproses file dengan LLM menggunakan streaming dan versioning support"
+    },
+    "retryChat": {
+      "url": "/api/chat/{chatId}/retry",
+      "method": "POST",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "model": "string, required"
+      },
+      "response": {
+        "success": true,
+        "data": {
+          "newAssistantChat": "object",
+          "usage": "object",
+          "cost": {
+            "usd": "number",
+            "idr": "number"
+          }
+        }
+      },
+      "description": "Retry chat dengan prompt yang sama dan membuat versi baru"
+    },
+    "updateChat": {
+      "url": "/api/chat/{chatId}",
+      "method": "PATCH",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "payload": {
+        "isActive": "boolean, optional"
+      },
+      "response": {
+        "success": true,
+        "data": "object"
+      },
+      "description": "Update properti chat (seperti status aktif)"
+    },
+    "deleteChat": {
+      "url": "/api/chat/{chatId}",
+      "method": "DELETE",
+      "headers": {
+        "Authorization": "Bearer {token}"
+      },
+      "response": {
+        "success": true,
+        "message": "Chat deleted successfully"
+      },
+      "description": "Menghapus chat berdasarkan ID"
     }
   }
 }

@@ -13,6 +13,11 @@ router.get(
   llmController.getModels
 );
 
+router.get(
+  '/models-marketing',
+  llmController.getModelMarketing
+);
+
 // Chat completion (non-streaming) - DEPRECATED, use /chat/stream instead
 router.post(
   '/chat',
