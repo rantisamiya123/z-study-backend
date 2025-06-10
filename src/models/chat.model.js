@@ -16,18 +16,17 @@ class Chat {
     this.userId = data.userId;
     this.model = data.model;
     this.role = data.role; // 'user' or 'assistant'
-    this.parentChatId = data.parentChatId || null; // Reference to parent message
-    this.childChatIds = Array.isArray(data.childChatIds) ? data.childChatIds : []; // Array of child message IDs
-    this.messageIndex = this.ensureNumber(data.messageIndex, 0); // Position in conversation thread
-    this.isActive = Boolean(data.isActive !== false); // Whether this message is in the active conversation path
+    this.parentChatId = data.parentChatId || null;
+    this.childChatIds = Array.isArray(data.childChatIds) ? data.childChatIds : [];
+    this.messageIndex = this.ensureNumber(data.messageIndex, 0);
+    this.isActive = Boolean(data.isActive !== false);
     
-    // Version control fields
-    this.versionId = data.versionId || uuidv4(); // Unique version identifier
-    this.originalChatId = data.originalChatId || this.chatId; // Reference to the original chat this is a version of
-    this.versionNumber = this.ensureNumber(data.versionNumber, 1); // Version number (1, 2, 3, etc.)
-    this.isCurrentVersion = Boolean(data.isCurrentVersion !== false); // Whether this is the current active version
-    this.branchPoint = data.branchPoint || null; // The chat ID where this branch started
-    this.versionHistory = Array.isArray(data.versionHistory) ? data.versionHistory : []; // Array of version metadata
+    // Version control fields - SIMPLIFIED
+    this.versionId = data.versionId || uuidv4();
+    this.originalChatId = data.originalChatId || this.chatId; // Reference to the first version
+    this.versionNumber = this.ensureNumber(data.versionNumber, 1);
+    this.isCurrentVersion = Boolean(data.isCurrentVersion !== false);
+    this.branchFromMessageIndex = data.branchFromMessageIndex || null; // Where this version branches from
     
     // Ensure numeric values are properly typed
     this.promptTokens = this.ensureNumber(data.promptTokens, 0);
@@ -100,7 +99,6 @@ class Chat {
     this.filesUrl = Array.isArray(this.filesUrl) ? this.filesUrl : [];
     this.childChatIds = Array.isArray(this.childChatIds) ? this.childChatIds : [];
     this.editHistory = Array.isArray(this.editHistory) ? this.editHistory : [];
-    this.versionHistory = Array.isArray(this.versionHistory) ? this.versionHistory : [];
 
     // Ensure dates are ISO strings
     if (this.createdAt && !(this.createdAt instanceof Date) && typeof this.createdAt === 'string') {
@@ -205,7 +203,7 @@ class Chat {
     return versions.find(version => version.isCurrentVersion) || null;
   }
 
-  // Create a new version of an existing chat
+  // Create a new version of an existing chat (for editing)
   async createNewVersion(newContent, model) {
     try {
       // Get all existing versions to determine the next version number
@@ -233,18 +231,18 @@ class Chat {
         versionNumber: nextVersionNumber,
         isCurrentVersion: true,
         isActive: true,
-        branchPoint: this.chatId,
-        versionHistory: [
-          ...this.versionHistory,
+        branchFromMessageIndex: this.messageIndex,
+        filesUrl: this.filesUrl,
+        isEdited: true,
+        editHistory: [
+          ...this.editHistory,
           {
             versionNumber: nextVersionNumber,
             createdAt: new Date().toISOString(),
             previousContent: this.content,
             reason: 'user_edit'
           }
-        ],
-        filesUrl: this.filesUrl,
-        isEdited: true
+        ]
       });
 
       await newVersion.save();
@@ -284,7 +282,46 @@ class Chat {
     }
   }
 
-  // Find active conversation thread (only active messages with current versions)
+  // Get conversation thread for a specific version
+  static async getConversationThreadForVersion(conversationId, versionNumber, messageIndex) {
+    try {
+      const result = await Chat.findByConversationId(conversationId, {
+        limit: 1000,
+        activeOnly: true,
+        currentVersionOnly: false
+      });
+
+      // Filter messages based on version logic
+      const threadMessages = [];
+      
+      for (const chat of result.items) {
+        // Include messages before the branch point
+        if (chat.messageIndex < messageIndex) {
+          // Get current version of messages before branch
+          const currentVersion = await Chat.findCurrentVersion(chat.originalChatId);
+          if (currentVersion) {
+            threadMessages.push(currentVersion);
+          }
+        } 
+        // Include messages from the specific version branch
+        else if (chat.branchFromMessageIndex === messageIndex || chat.messageIndex === messageIndex) {
+          const specificVersion = await Chat.findVersionsByOriginalChatId(chat.originalChatId);
+          const versionChat = specificVersion.find(v => v.versionNumber === versionNumber);
+          if (versionChat) {
+            threadMessages.push(versionChat);
+          }
+        }
+      }
+
+      // Sort by message index
+      return threadMessages.sort((a, b) => a.messageIndex - b.messageIndex);
+    } catch (error) {
+      console.error('Error getting conversation thread for version:', error);
+      throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to get conversation thread for version');
+    }
+  }
+
+  // Find active conversation thread (only current versions)
   static async findActiveConversationThread(conversationId, options = {}) {
     const sanitizedConversationId = String(conversationId);
     
@@ -322,7 +359,7 @@ class Chat {
     }
   }
 
-  // Find chats by conversation ID with pagination (all messages including inactive)
+  // Find chats by conversation ID with pagination
   static async findByConversationId(conversationId, options = {}) {
     const sanitizedConversationId = String(conversationId);
     
@@ -413,24 +450,24 @@ class Chat {
     }
   }
 
-  // Deactivate chat and its children from a specific point (for version branching)
-  async deactivateFromPoint() {
+  // Deactivate subsequent messages when creating a new version branch
+  async deactivateSubsequentMessages() {
     try {
-      // Find all chats after this message index in the conversation
+      // Find all messages after this message index in the conversation
       const result = await Chat.findByConversationId(this.conversationId, {
         limit: 1000,
         activeOnly: true,
         currentVersionOnly: true
       });
 
-      const chatsToDeactivate = result.items.filter(chat => 
+      const messagesToDeactivate = result.items.filter(chat => 
         chat.messageIndex > this.messageIndex
       );
 
       // Batch update all messages to set isActive = false
       const batchRequests = [];
       
-      for (const chat of chatsToDeactivate) {
+      for (const chat of messagesToDeactivate) {
         batchRequests.push({
           PutRequest: {
             Item: {
@@ -456,86 +493,11 @@ class Chat {
         await docClient.send(new BatchWriteCommand(params));
       }
       
-      return chatsToDeactivate.length;
+      return messagesToDeactivate.length;
     } catch (error) {
-      console.error('Error deactivating chats from point:', error);
-      throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to deactivate chats from point');
+      console.error('Error deactivating subsequent messages:', error);
+      throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to deactivate subsequent messages');
     }
-  }
-
-  // Reactivate chat and its children for a specific version
-  async reactivateToPoint() {
-    try {
-      // Find all chats that were part of this version's timeline
-      const result = await Chat.findByConversationId(this.conversationId, {
-        limit: 1000,
-        activeOnly: false,
-        currentVersionOnly: false
-      });
-
-      // Find chats that should be reactivated based on this version's timeline
-      const chatsToReactivate = result.items.filter(chat => {
-        // Reactivate chats that are part of this version's branch
-        return chat.messageIndex <= this.messageIndex && 
-               (chat.branchPoint === this.branchPoint || chat.branchPoint === null);
-      });
-
-      // Batch update all messages to set isActive = true
-      const batchRequests = [];
-      
-      for (const chat of chatsToReactivate) {
-        batchRequests.push({
-          PutRequest: {
-            Item: {
-              ...chat,
-              isActive: true,
-              updatedAt: new Date().toISOString()
-            }
-          }
-        });
-      }
-      
-      // Process in batches of 25 (DynamoDB limit)
-      const batchSize = 25;
-      for (let i = 0; i < batchRequests.length; i += batchSize) {
-        const batch = batchRequests.slice(i, i + batchSize);
-        
-        const params = {
-          RequestItems: {
-            [TABLE_NAME]: batch
-          }
-        };
-        
-        await docClient.send(new BatchWriteCommand(params));
-      }
-      
-      return chatsToReactivate.length;
-    } catch (error) {
-      console.error('Error reactivating chats to point:', error);
-      throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to reactivate chats to point');
-    }
-  }
-
-  // Get all children recursively
-  async getAllChildrenRecursively() {
-    const allChildren = [];
-    
-    if (!this.childChatIds || this.childChatIds.length === 0) {
-      return allChildren;
-    }
-    
-    for (const childId of this.childChatIds) {
-      const child = await Chat.findById(childId);
-      if (child) {
-        allChildren.push(child);
-        
-        // Recursively get children of this child
-        const grandChildren = await child.getAllChildrenRecursively();
-        allChildren.push(...grandChildren);
-      }
-    }
-    
-    return allChildren;
   }
 
   // Add child chat ID
@@ -732,8 +694,7 @@ class Chat {
       originalChatId: this.originalChatId,
       versionNumber: this.versionNumber,
       isCurrentVersion: this.isCurrentVersion,
-      branchPoint: this.branchPoint,
-      versionHistory: this.versionHistory,
+      branchFromMessageIndex: this.branchFromMessageIndex,
       promptTokens: this.promptTokens,
       completionTokens: this.completionTokens,
       totalTokens: this.totalTokens,

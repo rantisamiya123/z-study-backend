@@ -122,7 +122,7 @@ const createChatPair = async ({
 };
 
 /**
- * Edit a user message (creates new version, does NOT regenerate assistant response)
+ * Edit a user message (creates new version and deactivates subsequent messages)
  * @param {string} chatId - Chat ID to edit
  * @param {string} newContent - New content for the message
  * @param {string} userId - User ID for authorization
@@ -142,7 +142,7 @@ const editUserMessage = async (chatId, newContent, userId) => {
 
     // Deactivate all messages after this point in the conversation
     // This creates a branch point where the conversation can diverge
-    await newUserVersion.deactivateFromPoint();
+    const deactivatedCount = await newUserVersion.deactivateSubsequentMessages();
 
     // Get versioning information
     const allVersions = await Chat.findVersionsByOriginalChatId(newUserVersion.originalChatId);
@@ -161,7 +161,7 @@ const editUserMessage = async (chatId, newContent, userId) => {
       },
       branchInfo: {
         branchCreated: true,
-        deactivatedMessagesCount: await newUserVersion.deactivateFromPoint(),
+        deactivatedMessagesCount: deactivatedCount,
         message: 'Message edited. Subsequent messages have been deactivated. You can generate a new response or switch between versions.'
       }
     };
@@ -419,11 +419,11 @@ const generateResponseForUserMessage = async (chatId, userId, model, res) => {
 };
 
 /**
- * Switch to a specific version of a chat
+ * Switch to a specific version of a chat and rebuild conversation thread
  * @param {string} originalChatId - Original chat ID
  * @param {number} versionNumber - Version number to switch to
  * @param {string} userId - User ID for authorization
- * @returns {Promise<Object>} - Switched version and affected chats
+ * @returns {Promise<Object>} - Switched version and conversation thread
  */
 const switchToVersion = async (originalChatId, versionNumber, userId) => {
   try {
@@ -433,14 +433,12 @@ const switchToVersion = async (originalChatId, versionNumber, userId) => {
     // Switch to the specified version
     const targetVersion = await Chat.switchToVersion(originalChat.originalChatId, versionNumber);
     
-    // Deactivate all messages after this version's point
-    await targetVersion.deactivateFromPoint();
-    
-    // Reactivate messages that should be part of this version's timeline
-    await targetVersion.reactivateToPoint();
-
-    // Get the updated conversation thread
-    const updatedThread = await getActiveConversationHistory(targetVersion.conversationId, 999999);
+    // Get the conversation thread for this specific version
+    const conversationThread = await Chat.getConversationThreadForVersion(
+      targetVersion.conversationId, 
+      versionNumber, 
+      targetVersion.messageIndex
+    );
 
     // Get versioning info
     const allVersions = await Chat.findVersionsByOriginalChatId(targetVersion.originalChatId);
@@ -457,10 +455,13 @@ const switchToVersion = async (originalChatId, versionNumber, userId) => {
           content: v.content.substring(0, 100) + (v.content.length > 100 ? '...' : '')
         }))
       },
-      conversationThread: updatedThread,
+      conversationThread: conversationThread.map(chat => ({
+        ...chat.toJSON(),
+        hasMultipleVersions: allVersions.some(v => v.originalChatId === chat.originalChatId && allVersions.length > 1)
+      })),
       switchInfo: {
         message: `Successfully switched to version ${versionNumber}`,
-        affectedMessages: updatedThread.length
+        affectedMessages: conversationThread.length
       }
     };
 
@@ -494,7 +495,7 @@ const getChatVersions = async (originalChatId, userId) => {
       content: version.content,
       createdAt: version.createdAt,
       updatedAt: version.updatedAt,
-      versionHistory: version.versionHistory,
+      editHistory: version.editHistory,
       contentPreview: version.content.substring(0, 200) + (version.content.length > 200 ? '...' : ''),
       wordCount: version.content.split(' ').length,
       characterCount: version.content.length
