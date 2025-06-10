@@ -8,9 +8,9 @@ const router = express.Router();
  * Chat History Routes
  */
 
-// Get chat history for a conversation with versioning information
+// Get chat history for a conversation with lazy loading support
 // GET /api/chat/conversation/:conversationId
-// Query params: limit, lastEvaluatedKey, sortOrder, activeOnly, currentVersionOnly
+// Query params: limit, lastEvaluatedKey, sortOrder, includeVersions
 router.get(
   '/conversation/:conversationId',
   auth(),
@@ -51,22 +51,22 @@ router.post(
  * Chat Editing Routes
  */
 
-// Edit a user message content (creates new version, no auto-regeneration)
+// Edit user message and auto-complete with streaming (RECOMMENDED)
+// PUT /api/chat/:chatId/edit-and-complete
+// Body: { content, model, autoComplete? }
+router.put(
+  '/:chatId/edit-and-complete',
+  auth(),
+  chatController.editUserMessageAndComplete
+);
+
+// Edit user message only (no auto-completion)
 // PUT /api/chat/:chatId/edit
 // Body: { content }
 router.put(
   '/:chatId/edit',
   auth(),
   chatController.editUserMessage
-);
-
-// Edit assistant response content (creates new version)
-// PUT /api/chat/:chatId/edit-response
-// Body: { content }
-router.put(
-  '/:chatId/edit-response',
-  auth(),
-  chatController.editAssistantResponse
 );
 
 /**
@@ -95,8 +95,9 @@ router.post(
   chatController.switchToVersion
 );
 
-// Get all versions of a specific chat
+// Get all versions of a specific chat with pagination
 // GET /api/chat/:chatId/versions
+// Query params: limit, page
 router.get(
   '/:chatId/versions',
   auth(),

@@ -38,6 +38,20 @@ const createChat = async (chatData) => {
 };
 
 /**
+ * Get next message index for a conversation
+ * @param {string} conversationId - Conversation ID
+ * @returns {Promise<number>} - Next message index
+ */
+const getNextMessageIndex = async (conversationId) => {
+  try {
+    return await Chat.getNextMessageIndex(conversationId);
+  } catch (error) {
+    console.error('Error getting next message index:', error);
+    return 0;
+  }
+};
+
+/**
  * Create a pair of user and assistant messages
  * @param {Object} params - Parameters for creating chat pair
  * @returns {Promise<Object>} - Created user and assistant chats
@@ -561,28 +575,12 @@ const getConversationChats = async (conversationId, userId, options = {}) => {
 
     const count = await Chat.countByConversationId(conversationId);
 
-    // Enhance each chat with version information
-    const enhancedChats = await Promise.all(
-      result.items.map(async (chat) => {
-        const versions = await Chat.findVersionsByOriginalChatId(chat.originalChatId);
-        return {
-          ...chat.toJSON(),
-          hasMultipleVersions: versions.length > 1,
-          totalVersions: versions.length,
-          availableVersions: versions.map(v => ({
-            versionNumber: v.versionNumber,
-            isCurrentVersion: v.isCurrentVersion,
-            createdAt: v.createdAt,
-            contentPreview: v.content.substring(0, 100) + (v.content.length > 100 ? '...' : '')
-          })),
-          editInfo: {
-            canEdit: true,
-            lastEditedAt: chat.updatedAt,
-            isEdited: chat.isEdited
-          }
-        };
-      })
-    );
+    // For performance, we don't enhance with version info by default
+    // Frontend can request version info separately when needed
+    const enhancedChats = result.items.map(chat => ({
+      ...chat.toJSON(),
+      canEdit: chat.role === 'user' || chat.role === 'assistant'
+    }));
 
     return {
       success: true,
@@ -908,6 +906,7 @@ const getUserChatHistory = async (userId, options = {}) => {
 module.exports = {
   createChat,
   createChatPair,
+  getNextMessageIndex,
   editUserMessage,
   editAssistantResponse,
   generateResponseForUserMessage,

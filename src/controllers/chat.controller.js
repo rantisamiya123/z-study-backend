@@ -9,28 +9,77 @@ const ApiError = require('../utils/error.util');
 const tokenCounter = require('../utils/tokenCounter.util');
 
 /**
- * Get chat history for a conversation with versioning information
+ * Get chat history for a conversation with versioning information and lazy loading
  * GET /api/chat/conversation/:conversationId
  * 
  * Query Parameters:
- * - limit: Number of messages to return (default: 20)
- * - lastEvaluatedKey: For pagination
- * - sortOrder: 'asc' or 'desc' (default: 'asc')
- * - activeOnly: Show only active messages (default: true)
- * - currentVersionOnly: Show only current versions (default: true)
+ * - limit: Number of messages to return (default: 20, max: 100)
+ * - lastEvaluatedKey: For pagination (base64 encoded)
+ * - sortOrder: 'asc' or 'desc' (default: 'desc' for latest first)
+ * - includeVersions: Include version metadata (default: false for performance)
  * 
- * Response includes versioning information for each message
+ * Response includes only current versions for optimal performance
  */
 const getConversationChats = catchAsync(async (req, res) => {
     const { conversationId } = req.params;
     const { userId } = req.user;
-    const options = req.query;
+    const { 
+        limit = 20, 
+        lastEvaluatedKey = null, 
+        sortOrder = 'desc',
+        includeVersions = false 
+    } = req.query;
+
+    // Validate limit
+    const sanitizedLimit = Math.min(Math.max(1, parseInt(limit)), 100);
+
+    const options = {
+        limit: sanitizedLimit,
+        lastEvaluatedKey: lastEvaluatedKey ? JSON.parse(Buffer.from(lastEvaluatedKey, 'base64').toString()) : null,
+        sortOrder,
+        activeOnly: true,
+        currentVersionOnly: true // Always get current versions only for main chat history
+    };
 
     const chats = await chatService.getConversationChats(conversationId, userId, options);
     
+    // Encode lastEvaluatedKey for frontend
+    const encodedLastKey = chats.data.lastEvaluatedKey 
+        ? Buffer.from(JSON.stringify(chats.data.lastEvaluatedKey)).toString('base64')
+        : null;
+
+    // Enhance with version info only if requested
+    let enhancedResults = chats.data.results;
+    if (includeVersions === 'true') {
+        enhancedResults = await Promise.all(
+            chats.data.results.map(async (chat) => {
+                const versions = await chatService.getChatVersions(chat.originalChatId || chat.chatId, userId);
+                return {
+                    ...chat,
+                    hasMultipleVersions: versions.length > 1,
+                    totalVersions: versions.length,
+                    canEdit: chat.role === 'user' || chat.role === 'assistant'
+                };
+            })
+        );
+    } else {
+        // Minimal version info for performance
+        enhancedResults = chats.data.results.map(chat => ({
+            ...chat,
+            canEdit: chat.role === 'user' || chat.role === 'assistant'
+        }));
+    }
+
     res.status(httpStatus.OK).send({
         success: true,
-        data: chats
+        data: {
+            results: enhancedResults,
+            lastEvaluatedKey: encodedLastKey,
+            hasMore: !!chats.data.lastEvaluatedKey,
+            limit: sanitizedLimit,
+            totalResults: chats.data.totalResults,
+            conversationInfo: chats.data.conversationInfo
+        }
     });
 });
 
@@ -51,18 +100,227 @@ const getChatById = catchAsync(async (req, res) => {
 });
 
 /**
- * Edit a user message content (creates new version)
+ * Edit user message and auto-generate new response with streaming
+ * PUT /api/chat/:chatId/edit-and-complete
+ * 
+ * Body:
+ * - content: New message content (required)
+ * - model: Model to use for new completion (required)
+ * - autoComplete: Whether to auto-generate response (default: true)
+ * 
+ * This endpoint combines editing and completion for better UX
+ * Returns streaming response for the new completion
+ */
+const editUserMessageAndComplete = catchAsync(async (req, res) => {
+    const { chatId } = req.params;
+    const { userId } = req.user;
+    const { content, model, autoComplete = true } = req.body;
+
+    if (!content || typeof content !== 'string' || content.trim().length === 0) {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Content is required and cannot be empty');
+    }
+
+    if (!model) {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Model is required for completion');
+    }
+
+    // Set headers for SSE
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Transfer-Encoding': 'chunked',
+        'X-Accel-Buffering': 'no'
+    });
+
+    let stream;
+
+    try {
+        // Step 1: Edit the user message
+        const editResult = await chatService.editUserMessage(chatId, content.trim(), userId);
+        
+        // Send edit confirmation
+        res.write(`event: edit-complete\ndata: ${JSON.stringify({
+            editedMessage: editResult.editedMessage,
+            branchInfo: editResult.branchInfo
+        })}\n\n`);
+
+        if (!autoComplete) {
+            res.write(`event: done\ndata: [DONE]\n\n`);
+            return res.end();
+        }
+
+        // Step 2: Auto-generate new response
+        const newUserChatId = editResult.editedMessage.chatId;
+        
+        // Check user balance first
+        const user = await userService.getUserById(userId);
+        const models = await openrouterService.fetchModels();
+        const selectedModel = models.find(m => m.id === model);
+        
+        if (!selectedModel) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Invalid model selected');
+        }
+
+        // Get conversation history up to the edited message
+        const conversationHistory = await chatService.getActiveConversationHistory(
+            editResult.editedMessage.conversationId, 
+            editResult.editedMessage.messageIndex + 1
+        );
+
+        // Prepare messages for OpenRouter
+        const messages = conversationHistory.map(chat => ({
+            role: chat.role,
+            content: chat.content
+        }));
+
+        // Estimate cost
+        const estimatedPromptTokens = tokenCounter.countTokens(messages);
+        const estimatedOutputTokens = Math.min(1000, selectedModel.context_length * 0.2);
+        const exchangeRate = await settingService.getExchangeRate();
+        const estimatedInputCostUSD = (estimatedPromptTokens / 1000) * selectedModel.pricing.prompt;
+        const estimatedOutputCostUSD = (estimatedOutputTokens / 1000) * selectedModel.pricing.completion;
+        const estimatedTotalCostUSD = estimatedInputCostUSD + estimatedOutputCostUSD;
+        const estimatedTotalCostIDR = estimatedTotalCostUSD * exchangeRate;
+
+        // Check balance
+        if (user.balance < estimatedTotalCostIDR) {
+            res.write(`event: error\ndata: ${JSON.stringify({ 
+                error: 'Insufficient balance for completion',
+                required: estimatedTotalCostIDR,
+                current: user.balance
+            })}\n\n`);
+            return res.end();
+        }
+
+        // Send completion start event
+        res.write(`event: completion-start\ndata: ${JSON.stringify({
+            message: 'Starting AI response generation...'
+        })}\n\n`);
+
+        // Start streaming completion
+        const { stream: responseStream } = await openrouterService.createChatCompletionStream(
+            userId, model, messages
+        );
+        
+        stream = responseStream;
+        let responseText = '';
+        let usage = null;
+
+        stream.on('data', (chunk) => {
+            const data = chunk.toString();
+            const lines = data.split('\n').filter(line => line.trim().startsWith('data:'));
+
+            for (let line of lines) {
+                let dataSliced = line.trim().slice(5).trim();
+
+                while (dataSliced.startsWith('data:')) {
+                    dataSliced = dataSliced.slice(5).trim();
+                }
+
+                try {
+                    const parsedData = JSON.parse(dataSliced);
+
+                    if (parsedData.usage) {
+                        usage = parsedData.usage;
+                    }
+
+                    if (parsedData.choices && parsedData.choices[0].delta && parsedData.choices[0].delta.content) {
+                        responseText += parsedData.choices[0].delta.content;
+                    }
+
+                    // Forward completion data to client
+                    res.write(`event: completion-data\ndata: ${JSON.stringify(parsedData)}\n\n`);
+                } catch (err) {
+                    console.error('JSON parse error:', err.message, dataSliced);
+                }
+            }
+
+            if (res.flush) res.flush();
+        });
+
+        stream.on('end', async () => {
+            try {
+                if (usage) {
+                    const { prompt_tokens, completion_tokens, total_tokens } = usage;
+                    const inputCostUSD = (prompt_tokens / 1000) * selectedModel.pricing.prompt;
+                    const outputCostUSD = (completion_tokens / 1000) * selectedModel.pricing.completion;
+                    const totalCostUSD = inputCostUSD + outputCostUSD;
+                    const totalCostIDR = totalCostUSD * exchangeRate;
+
+                    // Deduct from user balance
+                    await userService.updateBalance(userId, -totalCostIDR);
+
+                    // Create new assistant response
+                    const assistantMessageIndex = await chatService.getNextMessageIndex(editResult.editedMessage.conversationId);
+                    const newAssistantChat = await chatService.createChat({
+                        conversationId: editResult.editedMessage.conversationId,
+                        userId,
+                        model,
+                        role: 'assistant',
+                        content: responseText,
+                        parentChatId: newUserChatId,
+                        messageIndex: assistantMessageIndex,
+                        isActive: true,
+                        isCurrentVersion: true,
+                        versionNumber: 1,
+                        promptTokens: prompt_tokens,
+                        completionTokens: completion_tokens,
+                        totalTokens: total_tokens,
+                        costUSD: totalCostUSD,
+                        costIDR: totalCostIDR
+                    });
+
+                    // Update parent-child relationship
+                    const editedUserChat = await chatService.getChatById(newUserChatId, userId);
+                    await editedUserChat.addChildChatId(newAssistantChat.chatId);
+
+                    // Send completion result
+                    res.write(`event: completion-complete\ndata: ${JSON.stringify({ 
+                        usage, 
+                        cost: { 
+                            usd: totalCostUSD, 
+                            idr: totalCostIDR 
+                        },
+                        assistantMessage: newAssistantChat.toJSON()
+                    })}\n\n`);
+                }
+
+                res.write(`event: done\ndata: [DONE]\n\n`);
+                res.end();
+            } catch (error) {
+                console.error('Error saving completion:', error);
+                res.write(`event: error\ndata: ${JSON.stringify({ error: 'Error saving completion results' })}\n\n`);
+                res.end();
+            }
+        });
+
+        stream.on('error', (error) => {
+            res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
+            res.end();
+        });
+
+        req.on('close', () => {
+            if (stream) stream.destroy();
+        });
+
+    } catch (error) {
+        console.error('Edit and complete error:', error);
+        if (stream) stream.destroy();
+
+        res.write(`event: error\ndata: ${JSON.stringify({ 
+            error: error.message || 'An error occurred during edit and completion' 
+        })}\n\n`);
+        res.end();
+    }
+});
+
+/**
+ * Edit user message only (no auto-completion)
  * PUT /api/chat/:chatId/edit
  * 
  * Body:
  * - content: New message content (required)
- * 
- * Logic:
- * 1. Only user messages can be edited
- * 2. Creates new version of the user message
- * 3. Does NOT regenerate assistant response automatically
- * 4. Marks subsequent messages as inactive (conversation branches here)
- * 5. Returns versioning information
  */
 const editUserMessage = catchAsync(async (req, res) => {
     const { chatId } = req.params;
@@ -83,32 +341,63 @@ const editUserMessage = catchAsync(async (req, res) => {
 });
 
 /**
- * Edit assistant response content (creates new version)
- * PUT /api/chat/:chatId/edit-response
+ * Get all versions of a specific chat with pagination
+ * GET /api/chat/:chatId/versions
  * 
- * Body:
- * - content: New response content (required)
- * 
- * Logic:
- * 1. Only assistant messages can be edited
- * 2. Creates new version of the assistant response
- * 3. Does NOT trigger any regeneration
- * 4. Updates versioning information
+ * Query Parameters:
+ * - limit: Number of versions to return (default: 10)
+ * - page: Page number (default: 1)
  */
-const editAssistantResponse = catchAsync(async (req, res) => {
+const getChatVersions = catchAsync(async (req, res) => {
     const { chatId } = req.params;
     const { userId } = req.user;
-    const { content } = req.body;
+    const { limit = 10, page = 1 } = req.query;
 
-    if (!content || typeof content !== 'string' || content.trim().length === 0) {
-        throw new ApiError(httpStatus.BAD_REQUEST, 'Content is required and cannot be empty');
-    }
-
-    const result = await chatService.editAssistantResponse(chatId, content.trim(), userId);
+    const versions = await chatService.getChatVersions(chatId, userId);
+    
+    // Apply pagination
+    const sanitizedLimit = Math.min(Math.max(1, parseInt(limit)), 50);
+    const sanitizedPage = Math.max(1, parseInt(page));
+    const startIndex = (sanitizedPage - 1) * sanitizedLimit;
+    const endIndex = startIndex + sanitizedLimit;
+    const paginatedVersions = versions.slice(startIndex, endIndex);
     
     res.status(httpStatus.OK).send({
         success: true,
-        message: 'Response edited successfully',
+        data: {
+            versions: paginatedVersions,
+            pagination: {
+                page: sanitizedPage,
+                limit: sanitizedLimit,
+                total: versions.length,
+                totalPages: Math.ceil(versions.length / sanitizedLimit),
+                hasMore: endIndex < versions.length
+            }
+        }
+    });
+});
+
+/**
+ * Switch to a specific version of a chat
+ * POST /api/chat/:chatId/switch-version
+ * 
+ * Body:
+ * - versionNumber: Version number to switch to (required)
+ */
+const switchToVersion = catchAsync(async (req, res) => {
+    const { chatId } = req.params;
+    const { userId } = req.user;
+    const { versionNumber } = req.body;
+
+    if (!versionNumber || typeof versionNumber !== 'number') {
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Version number is required and must be a number');
+    }
+
+    const result = await chatService.switchToVersion(chatId, versionNumber, userId);
+    
+    res.status(httpStatus.OK).send({
+        success: true,
+        message: 'Successfully switched to version',
         data: result
     });
 });
@@ -119,12 +408,6 @@ const editAssistantResponse = catchAsync(async (req, res) => {
  * 
  * Body:
  * - model: Model to use for generation (required)
- * 
- * Logic:
- * 1. Can only generate response for user messages
- * 2. Creates new assistant message or new version if one exists
- * 3. Uses streaming response
- * 4. Deducts cost from user balance
  */
 const generateResponse = catchAsync(async (req, res) => {
     const { chatId } = req.params;
@@ -150,7 +433,6 @@ const generateResponse = catchAsync(async (req, res) => {
         const result = await chatService.generateResponseForUserMessage(chatId, userId, model, res);
         
         // The response is handled in the service through streaming
-        // This endpoint doesn't return JSON, it streams the response
         
     } catch (error) {
         console.error('Generate response error:', error);
@@ -164,63 +446,8 @@ const generateResponse = catchAsync(async (req, res) => {
 });
 
 /**
- * Switch to a specific version of a chat
- * POST /api/chat/:chatId/switch-version
- * 
- * Body:
- * - versionNumber: Version number to switch to (required)
- * 
- * Logic:
- * 1. Switches the active version of a message
- * 2. Updates conversation timeline accordingly
- * 3. May affect subsequent messages in the conversation
- */
-const switchToVersion = catchAsync(async (req, res) => {
-    const { chatId } = req.params;
-    const { userId } = req.user;
-    const { versionNumber } = req.body;
-
-    if (!versionNumber || typeof versionNumber !== 'number') {
-        throw new ApiError(httpStatus.BAD_REQUEST, 'Version number is required and must be a number');
-    }
-
-    const result = await chatService.switchToVersion(chatId, versionNumber, userId);
-    
-    res.status(httpStatus.OK).send({
-        success: true,
-        message: 'Successfully switched to version',
-        data: result
-    });
-});
-
-/**
- * Get all versions of a specific chat
- * GET /api/chat/:chatId/versions
- * 
- * Returns all versions of a message with metadata
- */
-const getChatVersions = catchAsync(async (req, res) => {
-    const { chatId } = req.params;
-    const { userId } = req.user;
-
-    const versions = await chatService.getChatVersions(chatId, userId);
-    
-    res.status(httpStatus.OK).send({
-        success: true,
-        data: {
-            versions
-        }
-    });
-});
-
-/**
  * Delete a chat message
  * DELETE /api/chat/:chatId
- * 
- * Logic:
- * 1. Soft delete - marks as inactive
- * 2. May affect conversation flow
- * 3. Preserves versioning history
  */
 const deleteChat = catchAsync(async (req, res) => {
     const { chatId } = req.params;
@@ -234,19 +461,6 @@ const deleteChat = catchAsync(async (req, res) => {
 /**
  * Create new chat with streaming response
  * POST /api/chat/stream
- * 
- * Body:
- * - model: Model to use (required)
- * - messages: Array of messages (required)
- * - max_tokens: Maximum tokens for response (optional)
- * - conversationId: Existing conversation ID (optional)
- * 
- * Logic:
- * 1. Creates or finds conversation
- * 2. Validates user balance
- * 3. Streams response from LLM
- * 4. Creates chat pair (user + assistant)
- * 5. Deducts cost from balance
  */
 const chatCompletionStream = catchAsync(async (req, res) => {
     const { model, messages, max_tokens, conversationId } = req.body;
@@ -447,13 +661,6 @@ const chatCompletionStream = catchAsync(async (req, res) => {
 /**
  * Process file with chat completion (stream)
  * POST /api/chat/process-file/stream
- * 
- * Body:
- * - fileId: File ID to process (required)
- * - model: Model to use (required)
- * - prompt: User prompt (required)
- * - max_tokens: Maximum tokens (optional)
- * - conversationId: Conversation ID (optional)
  */
 const processFileStream = catchAsync(async (req, res) => {
     const { fileId, model, prompt, max_tokens, conversationId } = req.body;
@@ -677,7 +884,7 @@ module.exports = {
     getConversationChats,
     getChatById,
     editUserMessage,
-    editAssistantResponse,
+    editUserMessageAndComplete,
     generateResponse,
     switchToVersion,
     getChatVersions,
